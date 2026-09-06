@@ -5148,6 +5148,53 @@ done:
     return ret;
 }
 
+/* Script-path sign every leaf of `index` that `hdkey` participates in.
+ *
+ * Reads taproot_leaf_paths directly rather than going through
+ * wally_psbt_get_input_bip32_key_from_alloc, which stops consulting that map
+ * once the input holds a key-path signature. A signer asked for both signature
+ * kinds would otherwise lose the script-path one whenever the key path was
+ * signed first. */
+static int psbt_sign_leaves(struct wally_psbt *psbt, size_t index,
+                            const struct wally_tx *tx,
+                            struct wally_psbt_input *inp,
+                            const struct ext_key *hdkey)
+{
+    size_t subindex = 0;
+    int ret = WALLY_OK;
+
+    if (!inp->taproot_leaf_scripts.num_items)
+        return WALLY_OK;
+
+    while (ret == WALLY_OK) {
+        struct ext_key derived;
+        size_t found_index = 0, pubkey_idx = 0;
+
+        ret = wally_map_keypath_get_bip32_key_from(&inp->taproot_leaf_paths,
+                                                   subindex, hdkey,
+                                                   &derived, &found_index);
+        if (ret != WALLY_OK || !found_index)
+            break;
+        subindex = found_index; /* Resume past the entry just matched */
+
+        /* Search from zero: the leaf hash and leaf path maps are filled
+         * together but nothing enforces that their positions line up. */
+        ret = wally_map_find_bip32_public_key_from(&inp->taproot_leaf_hashes, 0,
+                                                   &derived, &pubkey_idx);
+        if (ret == WALLY_OK && pubkey_idx) {
+            const struct wally_map_item *lh;
+            lh = &inp->taproot_leaf_hashes.items[pubkey_idx - 1];
+            /* An empty leaf hash list marks the internal key, which has no
+             * leaf to sign. */
+            if (lh->value_len)
+                ret = psbt_sign_script_path(psbt, index, tx, inp, lh, &derived);
+        }
+        wally_clear(&derived, sizeof(derived));
+    }
+
+    return ret;
+}
+
 /* BIP-341: the internal key is the only key whose signature spends an output
  * by the key path. Tweaking any other key by the merkle root produces a
  * signature for a key that does not spend this input. */
@@ -5284,6 +5331,18 @@ int wally_psbt_sign_bip32(struct wally_psbt *psbt,
         uint32_t sighash_type;
         struct wally_psbt_input *inp;
 
+        inp = psbt_get_input_signature_type(psbt, i, &sighash_type);
+        if (!inp) {
+            ret = WALLY_EINVAL;
+            break;
+        }
+
+        /* Script-path first. A key can be asked for both kinds of signature on
+         * one input, so signing the leaves does not rule out the key path. */
+        if (sighash_type == WALLY_SIGTYPE_SW_V1 &&
+            (ret = psbt_sign_leaves(psbt, i, tx, inp, hdkey)) != WALLY_OK)
+            break;
+
         /* Get or derive a key for signing this input.
          * Note that we do not iterate subindex in this loop, so we will not
          * sign more than one signature that derives from the same parent key.
@@ -5292,34 +5351,6 @@ int wally_psbt_sign_bip32(struct wally_psbt *psbt,
                                                         0, hdkey, &derived);
         if (!derived)
             continue; /* No key to sign with */
-
-        inp = psbt_get_input_signature_type(psbt, i, &sighash_type);
-        if (!inp) {
-            bip32_key_free(derived);
-            ret = WALLY_EINVAL;
-            break;
-        }
-
-        if (sighash_type == WALLY_SIGTYPE_SW_V1 &&
-            inp->taproot_leaf_scripts.num_items > 0) {
-            /* Taproot with leaf scripts present: check if this key participates
-             * in any script-path leaves */
-            size_t pubkey_idx = 0;
-            int find_ret = wally_map_find_bip32_public_key_from(
-                &inp->taproot_leaf_hashes, subindex, derived, &pubkey_idx);
-
-            if (find_ret == WALLY_OK && pubkey_idx) {
-                const struct wally_map_item *lh_item =
-                    &inp->taproot_leaf_hashes.items[pubkey_idx - 1];
-                if (lh_item->value_len > 0) {
-                    /* Script-path: sign for each matching leaf */
-                    ret = psbt_sign_script_path(psbt, i, tx, inp, lh_item,
-                                                derived);
-                    bip32_key_free(derived);
-                    continue; /* Skip key-path signing for this input */
-                }
-            }
-        }
 
         if (sighash_type == WALLY_SIGTYPE_SW_V1 &&
             !psbt_is_taproot_internal_key(inp, derived)) {
