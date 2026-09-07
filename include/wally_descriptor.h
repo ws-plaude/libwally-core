@@ -96,6 +96,43 @@ WALLY_CORE_API int wally_descriptor_canonicalize(
     char **output);
 
 /**
+ * Return the text to write in place of a descriptor key expression.
+ *
+ * :param index: The zero-based index of the key expression being written.
+ * :param user_data: The value passed to `wally_descriptor_translate_keys`.
+ * :param output: Destination for the replacement text. The caller retains
+ *|    ownership; it is copied before this function is called again, and is
+ *|    not freed by wally.
+ */
+typedef int (*wally_descriptor_key_fn_t)(
+    size_t index,
+    void *user_data,
+    const char **output);
+
+/**
+ * Write a descriptor with every key expression replaced.
+ *
+ * :param descriptor: Parsed output descriptor or miniscript expression.
+ * :param flags: :ref:`ms-canonicalization-flags` controlling canonicalization.
+ * :param fn: Called once per key expression, in the order they appear, to
+ *|    produce its replacement text.
+ * :param user_data: Passed to ``fn`` unchanged.
+ * :param output: Destination for the resulting descriptor.
+ *|    The string returned should be freed using `wally_free_string`.
+ *
+ * Each replacement covers the key expression in full: its key origin, the key
+ * itself and any child path. Unless `WALLY_MS_CANONICAL_NO_CHECKSUM` is given,
+ * the result carries a checksum computed over what was written, so a
+ * translation that produces valid key expressions can be parsed back.
+ */
+WALLY_CORE_API int wally_descriptor_translate_keys(
+    const struct wally_descriptor *descriptor,
+    uint32_t flags,
+    wally_descriptor_key_fn_t fn,
+    void *user_data,
+    char **output);
+
+/**
  * Create an output descriptor checksum.
  *
  * :param descriptor: Parsed output descriptor or miniscript expression.

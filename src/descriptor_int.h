@@ -147,6 +147,12 @@ typedef struct ms_node_t {
     char wrapper_str[12];
     unsigned short flags; /* WALLY_MS_IS_ flags */
     unsigned char builtin;
+    /* Extent of a key expression within ms_ctx->src, covering its key origin,
+     * the key and any child path. Recorded before parsing rewrites data, which
+     * for a raw key points at decoded bytes rather than into the source.
+     * Keep these last: nodes are built with positional initializers. */
+    uint32_t expr_offset;
+    uint32_t expr_len;
 } ms_node;
 
 typedef struct wally_descriptor ms_ctx;

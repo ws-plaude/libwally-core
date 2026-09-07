@@ -1734,7 +1734,7 @@ static int generate_sh_wpkh(ms_ctx *ctx, ms_node *node,
     ms_node sh_node = { NULL, node, NULL, KIND_DESCRIPTOR_SH,
                         TYPE_NONE, 0, NULL, NULL, 0, 0,
                         {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-                        0, builtin_sh_index };
+                        0, builtin_sh_index, 0, 0 };
 
     if (ctx->variant != 3)
         return WALLY_ERROR; /* Should only be called to generate sh-wpkh */
@@ -2967,6 +2967,11 @@ static int analyze_miniscript_key(ms_ctx *ctx, uint32_t flags,
     if (!node || (parent && !parent->builtin))
         return WALLY_EINVAL;
 
+    if (ctx->src) {
+        node->expr_offset = (uint32_t)(node->data - ctx->src);
+        node->expr_len = node->data_len;
+    }
+
     /*
      * key origin identification
      * https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md#key-origin-identification
@@ -4195,6 +4200,126 @@ static int format_key_node(const struct wally_descriptor *descriptor,
         return WALLY_OK;
     }
     return WALLY_ERROR; /* Unknown key type */
+}
+
+/* Append len bytes to *buf, growing it as needed. *cap is its allocated size,
+ * *len its used size. Returns false and leaves *buf freed on failure. */
+static bool buf_append(char **buf, size_t *cap, size_t *len,
+                       const char *bytes, size_t bytes_len)
+{
+    if (bytes_len > *cap - *len) {
+        size_t new_cap = *cap;
+        char *grown;
+        while (bytes_len > new_cap - *len) {
+            if (new_cap > SIZE_MAX / 2)
+                goto fail;
+            new_cap *= 2;
+        }
+        if (!(grown = wally_malloc(new_cap)))
+            goto fail;
+        memcpy(grown, *buf, *len);
+        wally_free(*buf);
+        *buf = grown;
+        *cap = new_cap;
+    }
+    memcpy(*buf + *len, bytes, bytes_len);
+    *len += bytes_len;
+    return true;
+fail:
+    wally_free(*buf);
+    *buf = NULL;
+    return false;
+}
+
+int wally_descriptor_translate_keys(const struct wally_descriptor *descriptor,
+                                    uint32_t flags,
+                                    wally_descriptor_key_fn_t fn,
+                                    void *user_data, char **output)
+{
+    const bool want_checksum = !(flags & WALLY_MS_CANONICAL_NO_CHECKSUM);
+    size_t src_len, num_keys, offset = 0, i, cap, len = 0;
+    char *out;
+    int ret = WALLY_OK;
+
+    if (output)
+        *output = NULL;
+
+    if (!descriptor || !descriptor->src || !fn || !output ||
+        (flags & ~WALLY_MS_CANONICAL_NO_CHECKSUM) ||
+        descriptor->src_len < DESCRIPTOR_CHECKSUM_LENGTH + 1)
+        return WALLY_EINVAL;
+
+    /* src always ends in a checksum; we write our own or none at all */
+    src_len = descriptor->src_len - (DESCRIPTOR_CHECKSUM_LENGTH + 1);
+    num_keys = descriptor->keys.num_items;
+    if (!num_keys)
+        return WALLY_EINVAL; /* No key expressions to translate */
+
+    cap = descriptor->src_len + 1;
+    if (!(out = wally_malloc(cap)))
+        return WALLY_ENOMEM;
+
+    for (i = 0; i < num_keys; ++i) {
+        const ms_node *node = descriptor_get_key(descriptor, i);
+        const char *name = NULL;
+        size_t key_offset, key_len;
+
+        if (!node) {
+            ret = WALLY_ERROR;
+            break;
+        }
+        key_offset = node->expr_offset;
+        key_len = node->expr_len;
+        if (key_offset < offset || key_len > src_len - key_offset) {
+            ret = WALLY_ERROR; /* Overlapping or out of order key expressions */
+            break;
+        }
+        if ((ret = fn(i, user_data, &name)) != WALLY_OK)
+            break;
+        if (!name) {
+            ret = WALLY_EINVAL; /* No replacement given */
+            break;
+        }
+        /* Copied here, so the callback may reuse its buffer */
+        if (!buf_append(&out, &cap, &len, descriptor->src + offset,
+                        key_offset - offset) ||
+            !buf_append(&out, &cap, &len, name, strlen(name))) {
+            return WALLY_ENOMEM; /* buf_append freed out */
+        }
+        offset = key_offset + key_len;
+    }
+
+    if (ret == WALLY_OK &&
+        !buf_append(&out, &cap, &len, descriptor->src + offset,
+                    src_len - offset))
+        return WALLY_ENOMEM;
+
+    if (ret == WALLY_OK) {
+        char checksum[DESCRIPTOR_CHECKSUM_LENGTH + 1];
+        const char hash = '#';
+
+        if (want_checksum) {
+            if (generate_checksum(out, len, checksum) != WALLY_OK)
+                ret = WALLY_EINVAL; /* Replacement holds an invalid character */
+            else {
+                checksum[DESCRIPTOR_CHECKSUM_LENGTH] = '\0';
+                if (!buf_append(&out, &cap, &len, &hash, 1) ||
+                    !buf_append(&out, &cap, &len, checksum,
+                                DESCRIPTOR_CHECKSUM_LENGTH))
+                    return WALLY_ENOMEM;
+            }
+        }
+    }
+
+    if (ret == WALLY_OK) {
+        const char nul = '\0';
+        if (!buf_append(&out, &cap, &len, &nul, 1))
+            return WALLY_ENOMEM;
+        *output = out;
+        return WALLY_OK;
+    }
+    wally_free(out);
+    return ret;
 }
 
 int wally_descriptor_get_key(const struct wally_descriptor *descriptor,

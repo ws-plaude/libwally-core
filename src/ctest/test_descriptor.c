@@ -3243,6 +3243,138 @@ done_psbt:
     return ok;
 }
 
+/* Rebuild key expression `index` from wally's own accessors, so an identity
+ * translation must reproduce the canonical descriptor byte for byte. */
+static int identity_key_fn(size_t index, void *user_data, const char **output)
+{
+    static char buf[512];
+    struct wally_descriptor *descriptor = (struct wally_descriptor *)user_data;
+    char *key = NULL, *origin = NULL, *child = NULL, *fp_hex = NULL;
+    unsigned char fingerprint[4];
+    size_t len = 0;
+
+    buf[0] = '\0';
+    if (wally_descriptor_get_key_origin_fingerprint(descriptor, index,
+                                                    fingerprint, 4) == WALLY_OK) {
+        if (wally_hex_from_bytes(fingerprint, 4, &fp_hex) != WALLY_OK)
+            return WALLY_ENOMEM;
+        wally_descriptor_get_key_origin_path_str(descriptor, index, &origin);
+        len += snprintf(buf + len, sizeof(buf) - len, "[%s%s%s]", fp_hex,
+                        origin && *origin ? "/" : "", origin ? origin : "");
+        wally_free_string(fp_hex);
+        wally_free_string(origin);
+    }
+    if (wally_descriptor_get_key(descriptor, index, &key) != WALLY_OK)
+        return WALLY_ERROR;
+    len += snprintf(buf + len, sizeof(buf) - len, "%s", key);
+    wally_free_string(key);
+    if (wally_descriptor_get_key_child_path_str(descriptor, index,
+                                                &child) == WALLY_OK &&
+        child && *child)
+        snprintf(buf + len, sizeof(buf) - len, "/%s", child);
+    wally_free_string(child);
+    *output = buf;
+    return WALLY_OK;
+}
+
+/* Names each key expression by its index, reusing one buffer between calls to
+ * prove translate_keys copies what it is given. */
+static int letter_key_fn(size_t index, void *user_data, const char **output)
+{
+    static char buf[2];
+    (void)user_data;
+    buf[0] = (char)('A' + index);
+    buf[1] = '\0';
+    *output = buf;
+    return WALLY_OK;
+}
+
+static int failing_key_fn(size_t index, void *user_data, const char **output)
+{
+    (void)index;
+    (void)user_data;
+    (void)output;
+    return WALLY_EINVAL;
+}
+
+static bool check_translate_keys_case(const char *descriptor_str,
+                                      const char *expected)
+{
+    struct wally_descriptor *descriptor = NULL;
+    char *canonical = NULL, *translated = NULL;
+    bool ok = false;
+
+    if (wally_descriptor_parse(descriptor_str, NULL,
+                               WALLY_NETWORK_BITCOIN_MAINNET, 0,
+                               &descriptor) != WALLY_OK)
+        return false;
+
+    /* An identity translation must reproduce the canonical descriptor, proving
+     * every key expression's extent is found exactly. */
+    if (wally_descriptor_canonicalize(descriptor, 0, &canonical) != WALLY_OK ||
+        wally_descriptor_translate_keys(descriptor, 0, identity_key_fn,
+                                        descriptor, &translated) != WALLY_OK)
+        printf("  identity translation failed\n");
+    else if (strcmp(canonical, translated))
+        printf("  identity got  %s\n  identity want %s\n", translated, canonical);
+    if (canonical && translated && !strcmp(canonical, translated)) {
+        wally_free_string(translated);
+        translated = NULL;
+        /* Substituting names replaces origin, key and child path together. */
+        ok = wally_descriptor_translate_keys(descriptor,
+                                             WALLY_MS_CANONICAL_NO_CHECKSUM,
+                                             letter_key_fn, NULL,
+                                             &translated) == WALLY_OK &&
+             !strcmp(translated, expected);
+        if (!ok && translated)
+            printf("  got  %s\n  want %s\n", translated, expected);
+    }
+
+    /* A failing callback fails the call and yields nothing. */
+    if (ok) {
+        char *unused = (char *)1;
+        ok = wally_descriptor_translate_keys(descriptor, 0, failing_key_fn,
+                                             NULL, &unused) != WALLY_OK &&
+             !unused;
+        if (!ok)
+            printf("  failing callback not propagated\n");
+    }
+
+    wally_free_string(canonical);
+    wally_free_string(translated);
+    wally_descriptor_free(descriptor);
+    return ok;
+}
+
+static bool test_translate_keys(void)
+{
+    /* A taptree naming one signer at several accounts, an unspendable internal
+     * key with no origin, and multipath children throughout. */
+    if (!check_translate_keys_case(
+            "tr(xpub661MyMwAqRbcFLxggutdSjc4UfcPnJWpfZDvstBtgfXFUhr5jXRoZasQtXdhRFSXzGVLNvjt9QPziNBkPy2Vaud6meNhrF8TJoUy13xEa2R/<0;1>/*,"
+            "{multi_a(2,[73c5da0a/48'/0'/0'/2']xpub6DkFAXWQ2dHxq2vatrt9qyA3bXYU4ToWQwCHbf5XB2mSTexcHZCeKS1VZYcPoBd5X8yVcbXFHJR9R8UCVpt82VX1VhR28mCyxUFL4r6KFrf/<0;1>/*,"
+            "[b8688df1/48'/0'/0'/2']xpub6FQya7zGhR92kacYsNnjreouvnHJMpXYsUXnW6NJJAJRCKsa26TzDy4LdnGhEurr3d6y1J8PJ7EEMKQp74XTqYvmGJNogYXSKDszYHtF8mX/<0;1>/*),"
+            "and_v(v:multi_a(2,[73c5da0a/48'/0'/1'/2']xpub6DzhyrnFFYQ1HimDiM388xHnDiRPNdZJFBmmxge3Y1WWcHLtMJLfRuhRHqnQCPbTj3fGKTuKFLHzzwpJkp5Dtc3UtLKZKaVZe1yqMBXd6Vk/<0;1>/*,"
+            "[b8688df1/48'/0'/1'/2']xpub6EAMBJLn1jiquajTsNRkZXU1oKnA4WJMNvcz4FRR4QmFKdfHxJVvfRLoysWfcc16AMTR4CoMD8UNjvs9JtbsLeuLwpTczgq8zuuERnp8YZF/<0;1>/*,"
+            "[28645006/48'/0'/1'/2']xpub6F6gx8ZP9R3R3eYsU2PeS5EPJ4jN7Wbt9uwyHNXLoaJxQjNT92FGAfCNDjUDRhCHwzjfgDuqAZ7Gk9SugPRMa6A8PnzLVvnyEKBW9jHRGRp/<0;1>/*),"
+            "older(65535))})",
+            "tr(A,{multi_a(2,B,C),and_v(v:multi_a(2,D,E,F),older(65535))})"))
+        return false;
+
+    /* One key expression named twice, differing only in its child path. */
+    if (!check_translate_keys_case(
+            "wsh(or_d(pk([00000000/48'/0'/0'/2']xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/0/*),"
+            "and_v(v:pkh([00000000/48'/0'/0'/2']xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/2/*),older(144))))",
+            "wsh(or_d(pk(A),and_v(v:pkh(B),older(144))))"))
+        return false;
+
+    /* Raw keys, no origins and no child paths. */
+    return check_translate_keys_case(
+        "wsh(multi(2,038bc7431d9285a064b0328b6333f3a20b86664437b6de8f4e26e6bbdee258f048,"
+        "03a22745365f673e658f0d25eb0afa9aaece858c6a48dfe37a67210c2e23da8ce7))",
+        "wsh(multi(2,A,B))");
+}
+
 int main(void)
 {
     bool tests_ok = true;
@@ -3276,6 +3408,11 @@ int main(void)
 
     if (!test_psbt_taproot_scriptpath()) {
         printf("[test_psbt_taproot_scriptpath] failed!\n");
+        tests_ok = false;
+    }
+
+    if (!test_translate_keys()) {
+        printf("[test_translate_keys] failed!\n");
         tests_ok = false;
     }
 
